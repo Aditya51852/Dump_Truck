@@ -7,17 +7,25 @@
 
   Architecture:
   - Config.h          : Pinouts, credentials, thresholds, and enums
+  - TimeManager       : RTC DS3231, epoch time, and formatted timestamps
+  - MovementManager   : Haversine distance, speed, and motion state
+  - TimingManager     : Operational movement, holding, and zone durations
+  - CycleManager      : Cycle tracking and historical cycle records
   - BLEManager        : Background BLE beacon scanning and filtering
   - GPSManager        : Serial GPS parser using TinyGPSPlus
   - NFCManager        : Adafruit PN532 RFID/NFC driver
   - IMUManager        : MPU6500 6-DOF Accelerometer and Gyroscope
-  - DataManager       : State machine, RTC, vibration, and vehicle logic
-  - FirebaseManager   : WiFi & Firebase Realtime Database telemetry
+  - DataManager       : State machine, dual vibration detection, and recovery
+  - FirebaseManager   : WiFi, dynamic config, RTDB telemetry, and history
   ============================================================
 */
 
 #include <Wire.h>
 #include "Config.h"
+#include "TimeManager.h"
+#include "MovementManager.h"
+#include "TimingManager.h"
+#include "CycleManager.h"
 #include "DataManager.h"
 #include "GPSManager.h"
 #include "IMUManager.h"
@@ -29,11 +37,12 @@
 BLEManager ble;
 
 // Task timers
-static unsigned long lastSensorRead     = 0;
-static unsigned long lastFirebaseUpload = 0;
-static unsigned long lastWiFiCheck      = 0;
-static unsigned long lastBeaconCheck    = 0;
-static unsigned long lastNFCCheck       = 0;
+static unsigned long lastSensorRead      = 0;
+static unsigned long lastFirebaseUpload  = 0;
+static unsigned long lastWiFiCheck       = 0;
+static unsigned long lastBeaconCheck     = 0;
+static unsigned long lastNFCCheck        = 0;
+static unsigned long lastDailyStatsUpload = 0;
 
 void setup()
 {
@@ -76,7 +85,7 @@ void setup()
   Serial.println("--- END I2C SCAN ---");
   Serial.println();
 
-  // 3. Initialize DS3231 RTC
+  // 3. Initialize DS3231 RTC & Modular Managers
   dataManager.initSensorsAndRTC();
 
   // 4. Initialize PN532 NFC Module (with retry)
@@ -118,7 +127,10 @@ void setup()
   // 9. Initialize Firebase RTDB
   firebaseManager.begin();
 
-  // 10. Perform System Diagnostic & LED indication
+  // 10. Perform Power-On Recovery (Fetch last known state, calculate offline movement/holding)
+  dataManager.performBootRecovery();
+
+  // 11. Perform System Diagnostic & LED indication
   dataManager.updateSystemHealthLED();
 }
 
@@ -189,5 +201,14 @@ void loop()
   {
     lastFirebaseUpload = millis();
     firebaseManager.uploadCurrentStatus();
+  }
+
+  // ----------------------------------------------------------
+  // Periodic Daily Statistics upload
+  // ----------------------------------------------------------
+  if (millis() - lastDailyStatsUpload >= DAILY_STATS_INTERVAL)
+  {
+    lastDailyStatsUpload = millis();
+    firebaseManager.uploadDailyStats(timingManager.getDailyStats());
   }
 }

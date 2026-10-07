@@ -21,6 +21,7 @@ public:
 
   void begin();
   void initSensorsAndRTC();
+  void performBootRecovery();
   void updateRTC();
   void updateVibration();
   void updateAllSensors();
@@ -29,7 +30,7 @@ public:
   bool isRtcOk() const { return rtcOK; }
   void setRtcOk(bool ok) { rtcOK = ok; }
 
-  // Vibration logic
+  // Vibration logic (reads both analog & digital; digital triggers detection = YES)
   int getVibA0() const { return vibA0; }
   int getVibD0() const { return vibD0; }
   bool isVibrationDetected() const;
@@ -50,9 +51,10 @@ public:
   int getCycleNumber() const { return cycleNumber; }
   void resetShift();
 
-  // State Machine logic
+  // State Machine & Zone logic
   void processStateMachine(const String &currentBeaconID);
   void checkNFCReading();
+  void checkMovementSecurity();
 
   // LED indications
   void setLedState(uint8_t pin, uint8_t val);
@@ -63,8 +65,8 @@ public:
   void updateSystemHealthLED();
 
   // RTC time string buffers
-  const char* getDateString() const { return dateBuffer; }
-  const char* getTimeString() const { return timeBuffer; }
+  const char* getDateString() const;
+  const char* getTimeString() const;
 
   // Beacon / UUID tracking
   String getDetectedBeaconID() const { return detectedBeaconID; }
@@ -88,6 +90,7 @@ private:
   String currentNFCUID;
   String detectedBeaconID;
   String detectedZoneName;
+  String lastArrivalBeaconID;
 
   int cycleNumber;
   unsigned long cycleStartMillis;
@@ -101,6 +104,8 @@ private:
   unsigned long vibrationStartMillis;
   unsigned long vibrationStopMillis;
   bool loadingVibrationDetected;
+
+  bool unauthorizedMovementReported;
 
   // Sub-state machine routines
   void processExcavator(const String &beacon, const String &zoneName);

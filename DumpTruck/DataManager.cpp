@@ -3,6 +3,10 @@
 #include "GPSManager.h"
 #include "IMUManager.h"
 #include "NFCManager.h"
+#include "TimeManager.h"
+#include "MovementManager.h"
+#include "TimingManager.h"
+#include "CycleManager.h"
 
 DataManager dataManager;
 
@@ -15,6 +19,7 @@ DataManager::DataManager()
     currentNFCUID(""),
     detectedBeaconID(""),
     detectedZoneName(""),
+    lastArrivalBeaconID(""),
     cycleNumber(0),
     cycleStartMillis(0),
     excavatorArrivalMillis(0),
@@ -24,7 +29,8 @@ DataManager::DataManager()
     dumpCompleteMillis(0),
     vibrationStartMillis(0),
     vibrationStopMillis(0),
-    loadingVibrationDetected(false)
+    loadingVibrationDetected(false),
+    unauthorizedMovementReported(false)
 {
   strcpy(dateBuffer, "0000-00-00");
   strcpy(timeBuffer, "00:00:00");
@@ -47,68 +53,126 @@ void DataManager::begin()
 
 void DataManager::initSensorsAndRTC()
 {
+  rtcOK = timeManager.begin(Wire);
+  movementManager.begin();
+  timingManager.begin();
+  cycleManager.begin();
+}
+
+void DataManager::performBootRecovery()
+{
   Serial.println();
-  Serial.println("Initializing DS3231...");
+  Serial.println("==========================================");
+  Serial.println(">>> EXECUTING POWER-ON STATE RECOVERY <<<");
+  Serial.println("==========================================");
 
-  if (rtc.begin())
+  LastVehicleState lastState;
+  bool fetched = firebaseManager.fetchLastKnownState(lastState);
+
+  if (fetched && lastState.valid)
   {
-    rtcOK = true;
-    Serial.println("DS3231 detected.");
+    currentDriverID = lastState.driverId;
+    cycleNumber = lastState.cycleNumber;
+    cycleManager.setCycleNumber(cycleNumber);
+    currentState = (VehicleState)lastState.state;
 
-    if (rtc.lostPower())
+    if (currentDriverID.length() > 0)
     {
-      Serial.println("RTC lost power.");
-      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+      timingManager.onDriverAssigned(currentDriverID);
+      Serial.printf("Recovered Driver: %s\n", currentDriverID.c_str());
     }
+
+    uint32_t nowEpoch = timeManager.getEpoch();
+    if (lastState.timestamp > 0 && nowEpoch >= lastState.timestamp)
+    {
+      uint32_t offlineSec = nowEpoch - lastState.timestamp;
+      Serial.printf("System was offline for: %lu seconds\n", (unsigned long)offlineSec);
+
+      bool locationValid = gpsManager.isLocationValid();
+      int sats = gpsManager.getSatellites();
+
+      if (locationValid && sats >= movementManager.getMinimumSatellites() &&
+          lastState.latitude != 0.0 && lastState.longitude != 0.0)
+      {
+        double dist = MovementManager::calculateDistanceMeters(
+          lastState.latitude, lastState.longitude,
+          gpsManager.getLatitude(), gpsManager.getLongitude()
+        );
+
+        Serial.printf("Calculated displacement during offline: %.2f meters\n", dist);
+
+        if (dist >= movementManager.getDistanceThreshold())
+        {
+          Serial.println("ALERT: Vehicle moved while offline!");
+          bool hadDriver = (currentDriverID.length() > 0);
+          timingManager.addRecoveredMovement(offlineSec, hadDriver);
+
+          if (!hadDriver)
+          {
+            firebaseManager.uploadEvent("MOVEMENT_WITHOUT_DRIVER");
+          }
+        }
+        else
+        {
+          Serial.println("Vehicle remained stationary while offline.");
+          timingManager.addRecoveredHolding(offlineSec, currentState);
+        }
+      }
+      else
+      {
+        Serial.println("GPS fix unavailable at boot; attributing offline duration to holding.");
+        timingManager.addRecoveredHolding(offlineSec, currentState);
+      }
+    }
+
+    firebaseManager.uploadEvent("POWER_ON_RECOVERY");
   }
   else
   {
-    rtcOK = false;
-    Serial.println("ERROR: DS3231 not detected!");
+    Serial.println("No previous state to recover. Starting fresh in PARKED state.");
+    currentState = PARKED;
+    cycleNumber = 0;
+    currentDriverID = "";
+    cycleManager.setCycleNumber(0);
   }
+
+  timingManager.onStateChanged(currentState);
+  Serial.println("==========================================");
 }
 
 void DataManager::updateRTC()
 {
-  if (!rtcOK)
-  {
-    strcpy(dateBuffer, "0000-00-00");
-    strcpy(timeBuffer, "00:00:00");
-    return;
-  }
+  timeManager.update();
+  strncpy(dateBuffer, timeManager.getDateString(), sizeof(dateBuffer) - 1);
+  strncpy(timeBuffer, timeManager.getTimeString(), sizeof(timeBuffer) - 1);
+}
 
-  DateTime now = rtc.now();
+const char* DataManager::getDateString() const
+{
+  return timeManager.getDateString();
+}
 
-  snprintf(dateBuffer, sizeof(dateBuffer), "%04d-%02d-%02d",
-           now.year(), now.month(), now.day());
-
-  snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d:%02d",
-           now.hour(), now.minute(), now.second());
+const char* DataManager::getTimeString() const
+{
+  return timeManager.getTimeString();
 }
 
 void DataManager::updateVibration()
 {
+  // Read both analog and digital signals simultaneously
   vibA0 = analogRead(VIB_A0);
   vibD0 = digitalRead(VIB_D0);
 }
 
-void DataManager::updateAllSensors()
-{
-  updateRTC();
-  gpsManager.update();
-  updateVibration();
-  imuManager.update();
-}
-
 bool DataManager::isVibrationDetected() const
 {
+  // If digital detection triggers (HIGH) OR analog threshold is exceeded, detection state is YES
   return (vibD0 == HIGH || vibA0 > 2000);
 }
 
 bool DataManager::isVehicleMoving() const
 {
-  return (gpsManager.isLocationValid() &&
-          gpsManager.getSpeedKmph() >= MOVEMENT_SPEED_KMPH);
+  return movementManager.isMoving();
 }
 
 String DataManager::getStateName(VehicleState state)
@@ -139,27 +203,25 @@ void DataManager::changeState(VehicleState newState)
     return;
   }
 
-  String oldState = getStateName();
+  Serial.printf("State transition: %s -> %s\n",
+                getStateName(currentState).c_str(),
+                getStateName(newState).c_str());
+
   currentState = newState;
-
-  Serial.println();
-  Serial.print("STATE CHANGE: ");
-  Serial.print(oldState);
-  Serial.print(" -> ");
-  Serial.println(getStateName());
-
+  timingManager.onStateChanged(newState);
   firebaseManager.uploadEvent("STATE_CHANGE");
 }
 
 void DataManager::assignDriver(const String &driverID)
 {
   currentDriverID = driverID;
+  timingManager.onDriverAssigned(driverID);
 }
 
 void DataManager::clearDriver()
 {
   currentDriverID = "";
-  currentNFCUID = "";
+  timingManager.onDriverCleared();
 }
 
 void DataManager::resetShift()
@@ -171,19 +233,73 @@ void DataManager::resetShift()
   loadingEndMillis = 0;
   dumpingArrivalMillis = 0;
   dumpCompleteMillis = 0;
-
   loadingVibrationDetected = false;
   vibrationStartMillis = 0;
   vibrationStopMillis = 0;
+  lastArrivalBeaconID = "";
+
+  timingManager.resetShift();
+  cycleManager.setCycleNumber(0);
+}
+
+void DataManager::checkMovementSecurity()
+{
+  if (isVehicleMoving() && currentDriverID.length() == 0)
+  {
+    if (!unauthorizedMovementReported)
+    {
+      unauthorizedMovementReported = true;
+      Serial.println();
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      Serial.println("ALERT: MOVEMENT WITHOUT DRIVER DETECTED!");
+      Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      firebaseManager.uploadEvent("MOVEMENT_WITHOUT_DRIVER");
+    }
+  }
+  else if (!isVehicleMoving())
+  {
+    unauthorizedMovementReported = false;
+  }
+}
+
+void DataManager::updateAllSensors()
+{
+  updateRTC();
+  gpsManager.update();
+  movementManager.update();
+  updateVibration();
+  imuManager.update();
+
+  String zoneType = firebaseManager.inferZoneType(detectedBeaconID, detectedZoneName);
+  bool moving = isVehicleMoving();
+
+  timingManager.update(currentState, moving, zoneType, currentDriverID);
+  cycleManager.update(moving, zoneType);
+
+  checkMovementSecurity();
+
+  // If a cycle just completed, upload it immediately
+  if (cycleManager.hasCompletedCycleToUpload())
+  {
+    firebaseManager.uploadCycle(cycleManager.getLastCompletedCycle());
+    firebaseManager.uploadDailyStats(timingManager.getDailyStats());
+    cycleManager.clearUploadPending();
+  }
 }
 
 void DataManager::processExcavator(const String &beaconID, const String &zoneName)
 {
-  if (currentState == TO_EXCAVATOR || currentState == PARKED || currentState == DRIVER_ASSIGNED || currentState == DUMP_COMPLETE)
+  if (currentState == TO_EXCAVATOR || currentState == PARKED ||
+      currentState == DRIVER_ASSIGNED || currentState == DUMP_COMPLETE)
   {
     excavatorArrivalMillis = millis();
     changeState(AT_EXCAVATOR);
-    firebaseManager.uploadEvent("EXCAVATOR_ARRIVAL", beaconID, zoneName);
+
+    if (lastArrivalBeaconID != beaconID)
+    {
+      lastArrivalBeaconID = beaconID;
+      firebaseManager.uploadEvent("EXCAVATOR_ARRIVAL", beaconID, zoneName);
+    }
 
     Serial.println();
     Serial.printf(">>> EXCAVATOR AREA ARRIVED: %s (%s) <<<\n", beaconID.c_str(), zoneName.c_str());
@@ -257,7 +373,12 @@ void DataManager::processDumping(const String &beaconID, const String &zoneName)
   {
     dumpingArrivalMillis = millis();
     changeState(AT_DUMPING);
-    firebaseManager.uploadEvent("DUMPING_STATION_ARRIVAL", beaconID, zoneName);
+
+    if (lastArrivalBeaconID != beaconID)
+    {
+      lastArrivalBeaconID = beaconID;
+      firebaseManager.uploadEvent("DUMPING_STATION_ARRIVAL", beaconID, zoneName);
+    }
 
     Serial.println();
     Serial.printf(">>> DUMPING STATION ARRIVED: %s (%s) <<<\n", beaconID.c_str(), zoneName.c_str());
@@ -283,20 +404,27 @@ void DataManager::processNextCycle()
   {
     if (isVehicleMoving())
     {
+      cycleManager.completeCycle();
+      timingManager.incrementDailyCycleCount();
+      firebaseManager.uploadCycle(cycleManager.getLastCompletedCycle());
+      firebaseManager.uploadEvent("CYCLE_COMPLETED");
+
       cycleNumber++;
+      cycleManager.startCycle(cycleNumber, currentDriverID);
+
       cycleStartMillis = millis();
       excavatorArrivalMillis = 0;
       loadingStartMillis = 0;
       loadingEndMillis = 0;
       dumpingArrivalMillis = 0;
       dumpCompleteMillis = 0;
+      lastArrivalBeaconID = "";
 
       changeState(TO_EXCAVATOR);
       firebaseManager.uploadEvent("NEXT_CYCLE_STARTED");
 
       Serial.println();
-      Serial.print(">>> NEXT CYCLE: ");
-      Serial.println(cycleNumber);
+      Serial.printf(">>> NEXT CYCLE STARTED: #%d <<<\n", cycleNumber);
     }
   }
 }
@@ -305,7 +433,15 @@ void DataManager::processParking(const String &beaconID, const String &zoneName)
 {
   if (currentState != PARKED)
   {
-    firebaseManager.uploadEvent("PARKING_ARRIVAL", beaconID, zoneName);
+    if (lastArrivalBeaconID != beaconID)
+    {
+      lastArrivalBeaconID = beaconID;
+      firebaseManager.uploadEvent("PARKING_ARRIVAL", beaconID, zoneName);
+    }
+
+    cycleManager.completeCycle();
+    timingManager.incrementDailyCycleCount();
+    firebaseManager.uploadCycle(cycleManager.getLastCompletedCycle());
 
     clearDriver();
     resetShift();
@@ -339,7 +475,7 @@ void DataManager::processStateMachine(const String &currentBeaconID)
     return;
   }
 
-  // 1. Match beacon ID with Firebase vehicle_beacon_zones
+  // 1. Match beacon ID with Firebase beacon configuration
   String zoneName = "";
   String zoneType = "";
   bool matched = firebaseManager.validateBeaconZone(currentBeaconID, zoneName, zoneType);
@@ -353,7 +489,7 @@ void DataManager::processStateMachine(const String &currentBeaconID)
   else
   {
     detectedZoneName = "Unknown Zone";
-    Serial.printf("[ZONE UNKNOWN] ID: %s (Not in Firebase vehicle_beacon_zones)\n",
+    Serial.printf("[ZONE UNKNOWN] ID: %s (Not in Firebase configured zones)\n",
                   currentBeaconID.c_str());
   }
 
@@ -424,12 +560,14 @@ void DataManager::checkNFCReading()
     Serial.print("Driver ID: ");
     Serial.println(currentDriverID);
 
+    timingManager.onDriverAssigned(currentDriverID);
     firebaseManager.uploadEvent("DRIVER_ASSIGNED");
 
     // Start trip
     currentState = TO_EXCAVATOR;
     cycleNumber++;
     cycleStartMillis = millis();
+    cycleManager.startCycle(cycleNumber, currentDriverID);
 
     firebaseManager.uploadEvent("TRIP_STARTED");
   }
@@ -494,7 +632,7 @@ void DataManager::updateSystemHealthLED()
 {
   bool nfcOK = nfcManager.isOk();
   bool mpuOK = imuManager.isOk();
-  bool allOK = (rtcOK && nfcOK && mpuOK);
+  bool allOK = (timeManager.isRtcOk() && nfcOK && mpuOK);
 
   digitalWrite(LED_RED, allOK ? LOW : HIGH);
 
@@ -502,7 +640,7 @@ void DataManager::updateSystemHealthLED()
   Serial.println("======================================");
   Serial.println(" SYSTEM DIAGNOSTIC REPORT");
   Serial.println("--------------------------------------");
-  Serial.printf("  RTC  (DS3231)  : %s\n", rtcOK  ? "OK" : "FAIL");
+  Serial.printf("  RTC  (DS3231)  : %s\n", timeManager.isRtcOk() ? "OK" : "FAIL");
   Serial.printf("  NFC  (PN532)   : %s\n", nfcOK  ? "OK" : "FAIL");
   Serial.printf("  IMU  (MPU6500) : %s\n", mpuOK  ? "OK" : "FAIL");
   Serial.println("--------------------------------------");
@@ -510,7 +648,7 @@ void DataManager::updateSystemHealthLED()
   if (allOK)
   {
     Serial.println(" SYSTEM READY");
-    Serial.println(" STATE: PARKED");
+    Serial.printf(" STATE: %s\n", getStateName().c_str());
     Serial.println(" BLE SCANNER: READY");
   }
   else
@@ -524,7 +662,7 @@ void DataManager::updateSystemHealthLED()
     {
       Serial.println(" WARNING: IMU OFFLINE - No motion data");
     }
-    if (!rtcOK)
+    if (!timeManager.isRtcOk())
     {
       Serial.println(" WARNING: RTC OFFLINE - No timestamps");
     }
@@ -540,9 +678,11 @@ void DataManager::printStatus()
 {
   Serial.println();
   Serial.println("--------------------------------");
-  Serial.printf("STATE: %s\n", getStateName().c_str());
-  Serial.printf("Driver: %s\n", currentDriverID.length() > 0 ? currentDriverID.c_str() : "NONE");
-  Serial.printf("Cycle: %d\n", cycleNumber);
+  Serial.printf("VEHICLE: %s | STATE: %s\n", firebaseManager.getVehicleId().c_str(), getStateName().c_str());
+  Serial.printf("Driver: %s | Cycle: %d (Dur: %lu s)\n",
+                currentDriverID.length() > 0 ? currentDriverID.c_str() : "NONE",
+                cycleManager.getCycleNumber(),
+                (unsigned long)cycleManager.getCycleDurationSec());
 
   // GPS
   Serial.print("GPS: ");
@@ -556,7 +696,14 @@ void DataManager::printStatus()
   }
   Serial.printf(" Speed: %.2f km/h Sat: %d\n", gpsManager.getSpeedKmph(), gpsManager.getSatellites());
 
-  // Vibration
+  // Motion & Timing
+  Serial.printf("Motion: %s | Move: %lu s | Hold: %lu s | Oper: %lu s\n",
+                movementManager.isMoving() ? "MOVING" : "STOPPED",
+                (unsigned long)timingManager.getTotalMovementSec(),
+                (unsigned long)timingManager.getTotalHoldingSec(),
+                (unsigned long)timingManager.getTotalOperatingSec());
+
+  // Vibration (both analog and digital reported)
   Serial.printf("Vibration A0: %d D0: %d Detected: %s\n",
                 vibA0, vibD0, isVibrationDetected() ? "YES" : "NO");
 

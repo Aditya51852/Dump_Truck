@@ -3,9 +3,10 @@
 #include <Arduino.h>
 
 // ============================================================
-// DEVICE CONFIGURATION
+// DEVICE / MODULE IDENTIFICATION
 // ============================================================
-#define VEHICLE_ID "DUMPER_001"
+#define MODULE_ID       "MODULE_001"
+#define VEHICLE_ID      "DUMPER_001"
 
 // ============================================================
 // WIFI CONFIGURATION
@@ -77,13 +78,16 @@
 #define LOADING_VIBRATION_TIME 3000 // ms continuous vibration to start loading
 #define LOADING_STOP_TIME 5000      // ms without vibration to complete loading
 #define MOVEMENT_SPEED_KMPH 2.0     // km/h threshold for movement detection
+#define MOVEMENT_DIST_METERS 20.0   // meters threshold for movement detection
+#define GPS_MIN_SATELLITES   4      // minimum satellites for valid fix
 
 // Task Execution Intervals (ms)
-#define SENSOR_INTERVAL 1000
-#define FIREBASE_INTERVAL 5000
-#define WIFI_CHECK_INTERVAL 5000
-#define BEACON_INTERVAL 1000
-#define NFC_INTERVAL 300
+#define SENSOR_INTERVAL      1000
+#define FIREBASE_INTERVAL    5000
+#define WIFI_CHECK_INTERVAL  5000
+#define BEACON_INTERVAL      1000
+#define NFC_INTERVAL         300
+#define DAILY_STATS_INTERVAL 30000
 
 // ============================================================
 // VEHICLE STATE ENUM
