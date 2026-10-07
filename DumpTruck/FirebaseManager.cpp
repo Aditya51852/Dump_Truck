@@ -7,6 +7,7 @@
 #include "TimeManager.h"
 #include "TimingManager.h"
 #include "CycleManager.h"
+#include "TripManager.h"
 
 // Token & RTDB helper inclusions (only in this .cpp translation unit)
 #include "addons/TokenHelper.h"
@@ -381,10 +382,24 @@ bool FirebaseManager::fetchLastKnownState(LastVehicleState &lastState)
     if (json.get(d, "beacon/zoneName")) lastState.zoneName = d.stringValue;
     else                                lastState.zoneName = "";
 
-    Serial.printf("Last State Recovered: State=%s, Driver=%s, Cycle=%d, Epoch=%lu, Lat=%.6f, Lng=%.6f\n",
+    if (json.get(d, "session/sessionId")) lastState.sessionId = d.stringValue;
+    else                                  lastState.sessionId = "";
+
+    if (json.get(d, "trip/tripId"))       lastState.tripId = d.stringValue;
+    else                                  lastState.tripId = "";
+
+    if (json.get(d, "trip/tripNumber"))   lastState.tripNumber = d.intValue;
+    else                                  lastState.tripNumber = 0;
+
+    if (json.get(d, "trip/status"))       lastState.tripStatus = d.stringValue;
+    else                                  lastState.tripStatus = "IDLE";
+
+    Serial.printf("Last State Recovered: State=%s, Driver=%s, Cycle=%d, Session=%s, Trip=%s, Epoch=%lu, Lat=%.6f, Lng=%.6f\n",
                   lastState.stateName.c_str(),
                   lastState.driverId.c_str(),
                   lastState.cycleNumber,
+                  lastState.sessionId.c_str(),
+                  lastState.tripId.c_str(),
                   (unsigned long)lastState.timestamp,
                   lastState.latitude,
                   lastState.longitude);
@@ -415,6 +430,9 @@ void FirebaseManager::uploadEvent(const String &eventName, const String &beaconI
   json.set("longitude", gpsManager.getLongitude());
   json.set("speedKmph", gpsManager.getSpeedKmph());
   json.set("cycleNumber", dataManager.getCycleNumber());
+  json.set("sessionId", tripManager.getSessionId());
+  json.set("tripNumber", tripManager.getTripNumber());
+  json.set("tripId", tripManager.getTripId());
 
   if (beaconID != "")
   {
@@ -499,6 +517,23 @@ void FirebaseManager::uploadCurrentStatus()
   json.set("cycle/cycleNumber", cycleManager.getCycleNumber());
   json.set("cycle/cycleStartTime", (int)cycleManager.getCycleStartTime());
   json.set("cycle/cycleDurationSec", (int)cycleManager.getCycleDurationSec());
+
+  // Driver Session Metrics (extended)
+  json.set("session/sessionId", tripManager.getSessionId());
+  json.set("session/driverId", dataManager.getCurrentDriverID());
+  json.set("session/status", tripManager.isDriverSessionActive() ? "ACTIVE" : "NONE");
+  json.set("session/tripsCompleted", tripManager.getCurrentSession().tripsCompleted);
+  json.set("session/startTime", (int)tripManager.getCurrentSession().startTime);
+
+  // Operational Trip Metrics (extended)
+  json.set("trip/tripId", tripManager.getTripId());
+  json.set("trip/tripNumber", tripManager.getTripNumber());
+  json.set("trip/status", tripManager.isTripActive() ? "ACTIVE" : (tripManager.getTripStatus() == TRIP_COMPLETED ? "COMPLETED" : "IDLE"));
+  json.set("trip/startZone", tripManager.getCurrentTrip().startZone);
+  json.set("trip/startTimestamp", (int)tripManager.getCurrentTrip().startTimestamp);
+  json.set("trip/durationSec", (int)tripManager.getCurrentTrip().durationSec);
+  json.set("trip/segmentCount", tripManager.getCurrentTrip().segmentCount);
+  json.set("trip/routePath", tripManager.getCurrentTrip().routePath);
 
   // Hardware Diagnostics
   json.set("system/rtc", timeManager.isRtcOk());
@@ -622,4 +657,119 @@ bool FirebaseManager::findDriverFromNFC(const String &uid, String &driverID)
 
   Serial.printf("Driver lookup failed for UID %s: %s\n", uid.c_str(), fbdo.errorReason().c_str());
   return false;
+}
+
+void FirebaseManager::uploadTrip(const TripData &trip)
+{
+  if (!isReady()) return;
+
+  FirebaseJson json;
+  json.set("tripId", trip.tripId);
+  json.set("vehicleId", trip.vehicleId);
+  json.set("driverId", trip.driverId);
+  json.set("sessionId", trip.sessionId);
+  json.set("tripNumber", trip.tripNumber);
+  json.set("startZone", trip.startZone);
+  json.set("endZone", trip.endZone);
+  json.set("startTimestamp", (int)trip.startTimestamp);
+  json.set("endTimestamp", (int)trip.endTimestamp);
+  json.set("durationSec", (int)trip.durationSec);
+  json.set("status", trip.status);
+  json.set("segmentCount", trip.segmentCount);
+  json.set("movementSec", (int)trip.movementSec);
+  json.set("holdingSec", (int)trip.holdingSec);
+  json.set("routePath", trip.routePath);
+
+  String path = "/vehicles/" + activeVehicleId + "/trips/" + trip.tripId;
+
+  if (Firebase.RTDB.setJSON(&fbdo, path, &json))
+  {
+    Serial.printf("Trip #%d uploaded to %s\n", trip.tripNumber, path.c_str());
+  }
+  else
+  {
+    Serial.printf("Trip upload failed: %s\n", fbdo.errorReason().c_str());
+  }
+}
+
+void FirebaseManager::uploadSegment(const String &tripId, const SegmentData &segment)
+{
+  if (!isReady()) return;
+
+  FirebaseJson json;
+  json.set("segmentId", segment.segmentId);
+  json.set("fromZone", segment.fromZone);
+  json.set("toZone", segment.toZone);
+  json.set("departureTimestamp", (int)segment.departureTimestamp);
+  json.set("arrivalTimestamp", (int)segment.arrivalTimestamp);
+  json.set("travelTimeSec", (int)segment.travelTimeSec);
+  json.set("holdTimeSec", (int)segment.holdTimeSec);
+  json.set("driverId", segment.driverId);
+  json.set("sessionId", segment.sessionId);
+  json.set("tripNumber", segment.tripNumber);
+
+  String path = "/vehicles/" + activeVehicleId + "/trips/" + tripId + "/segments/" + segment.segmentId;
+
+  if (Firebase.RTDB.setJSON(&fbdo, path, &json))
+  {
+    Serial.printf("Segment %s uploaded to %s\n", segment.segmentId.c_str(), path.c_str());
+  }
+  else
+  {
+    Serial.printf("Segment upload failed: %s\n", fbdo.errorReason().c_str());
+  }
+}
+
+void FirebaseManager::uploadDriverSession(const DriverSessionData &session)
+{
+  if (!isReady() || session.sessionId.length() == 0) return;
+
+  FirebaseJson json;
+  json.set("sessionId", session.sessionId);
+  json.set("driverId", session.driverId);
+  json.set("vehicleId", activeVehicleId);
+  json.set("startTime", (int)session.startTime);
+  json.set("endTime", (int)session.endTime);
+  json.set("status", session.status);
+  json.set("tripsCompleted", session.tripsCompleted);
+  json.set("totalDurationSec", (int)session.totalDurationSec);
+  json.set("movementSec", (int)session.movementSec);
+  json.set("holdingSec", (int)session.holdingSec);
+
+  String path = "/vehicles/" + activeVehicleId + "/driver_sessions/" + session.sessionId;
+
+  if (Firebase.RTDB.setJSON(&fbdo, path, &json))
+  {
+    Serial.printf("Driver session %s uploaded to %s\n", session.sessionId.c_str(), path.c_str());
+  }
+  else
+  {
+    Serial.printf("Driver session upload failed: %s\n", fbdo.errorReason().c_str());
+  }
+}
+
+void FirebaseManager::uploadRouteAnalytics(const RouteAnalyticsData &analytics)
+{
+  if (!isReady() || analytics.routeKey.length() == 0) return;
+
+  FirebaseJson json;
+  json.set("fromZone", analytics.fromZone);
+  json.set("toZone", analytics.toZone);
+  json.set("routeKey", analytics.routeKey);
+  json.set("occurrenceCount", analytics.occurrenceCount);
+  json.set("totalTravelTimeSec", (int)analytics.totalTravelTimeSec);
+  json.set("averageTravelTimeSec", (int)analytics.averageTravelTimeSec);
+  json.set("totalHoldTimeSec", (int)analytics.totalHoldTimeSec);
+  json.set("averageHoldTimeSec", (int)analytics.averageHoldTimeSec);
+
+  String path = "/vehicles/" + activeVehicleId + "/route_analytics/" + analytics.routeKey;
+
+  if (Firebase.RTDB.setJSON(&fbdo, path, &json))
+  {
+    Serial.printf("Route Analytics %s uploaded to %s\n", analytics.routeKey.c_str(), path.c_str());
+  }
+  else
+  {
+    Serial.printf("Route Analytics upload failed: %s\n", fbdo.errorReason().c_str());
+  }
 }

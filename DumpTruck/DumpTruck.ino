@@ -26,6 +26,7 @@
 #include "MovementManager.h"
 #include "TimingManager.h"
 #include "CycleManager.h"
+#include "TripManager.h"
 #include "DataManager.h"
 #include "GPSManager.h"
 #include "IMUManager.h"

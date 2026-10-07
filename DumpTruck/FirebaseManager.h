@@ -29,7 +29,16 @@ struct LastVehicleState
   int cycleNumber;
   String beaconId;
   String zoneName;
+  String sessionId;
+  String tripId;
+  int tripNumber;
+  String tripStatus;
 };
+
+struct TripData;
+struct SegmentData;
+struct DriverSessionData;
+struct RouteAnalyticsData;
 
 class FirebaseManager
 {
@@ -63,6 +72,12 @@ public:
   void uploadCurrentStatus();
   void uploadCycle(const CycleData &cycle);
   void uploadDailyStats(const DailyStats &stats);
+
+  // Trip, Segment, Driver Session & Route Analytics Uploads
+  void uploadTrip(const TripData &trip);
+  void uploadSegment(const String &tripId, const SegmentData &segment);
+  void uploadDriverSession(const DriverSessionData &session);
+  void uploadRouteAnalytics(const RouteAnalyticsData &analytics);
 
   // Driver validation via NFC
   bool findDriverFromNFC(const String &uid, String &driverID);

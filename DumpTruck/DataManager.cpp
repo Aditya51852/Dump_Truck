@@ -7,6 +7,7 @@
 #include "MovementManager.h"
 #include "TimingManager.h"
 #include "CycleManager.h"
+#include "TripManager.h"
 
 DataManager dataManager;
 
@@ -57,6 +58,7 @@ void DataManager::initSensorsAndRTC()
   movementManager.begin();
   timingManager.begin();
   cycleManager.begin();
+  tripManager.begin();
 }
 
 void DataManager::performBootRecovery()
@@ -81,6 +83,10 @@ void DataManager::performBootRecovery()
       timingManager.onDriverAssigned(currentDriverID);
       Serial.printf("Recovered Driver: %s\n", currentDriverID.c_str());
     }
+
+    tripManager.recoverState(lastState.sessionId, lastState.driverId, lastState.tripNumber,
+                            lastState.tripId, (lastState.tripStatus == "ACTIVE"),
+                            lastState.timestamp, lastState.zoneName);
 
     uint32_t nowEpoch = timeManager.getEpoch();
     if (lastState.timestamp > 0 && nowEpoch >= lastState.timestamp)
@@ -275,6 +281,13 @@ void DataManager::updateAllSensors()
 
   timingManager.update(currentState, moving, zoneType, currentDriverID);
   cycleManager.update(moving, zoneType);
+  tripManager.update(moving, detectedBeaconID, zoneType);
+
+  // If trip starts away from Parking, advance vehicle state to TO_EXCAVATOR
+  if (tripManager.isTripActive() && (currentState == DRIVER_ASSIGNED || currentState == PARKED))
+  {
+    changeState(TO_EXCAVATOR);
+  }
 
   checkMovementSecurity();
 
@@ -552,24 +565,30 @@ void DataManager::checkNFCReading()
 
   if (valid)
   {
-    currentDriverID = driverID;
-    currentState = DRIVER_ASSIGNED;
-    validDriverLED();
+    bool isAtParking = (currentState == PARKED || currentState == DRIVER_ASSIGNED ||
+                        detectedBeaconID.startsWith("PARK") || detectedZoneName.indexOf("Parking") >= 0);
 
-    Serial.println("Driver successfully assigned.");
-    Serial.print("Driver ID: ");
-    Serial.println(currentDriverID);
+    bool driverRemainedAssigned = tripManager.onDriverTappedNFC(driverID, isAtParking);
 
-    timingManager.onDriverAssigned(currentDriverID);
-    firebaseManager.uploadEvent("DRIVER_ASSIGNED");
+    if (driverRemainedAssigned)
+    {
+      currentDriverID = driverID;
+      currentState = DRIVER_ASSIGNED;
+      validDriverLED();
+      timingManager.onDriverAssigned(currentDriverID);
 
-    // Start trip
-    currentState = TO_EXCAVATOR;
-    cycleNumber++;
-    cycleStartMillis = millis();
-    cycleManager.startCycle(cycleNumber, currentDriverID);
-
-    firebaseManager.uploadEvent("TRIP_STARTED");
+      Serial.println("Driver assigned / verified. Waiting at Parking for departure.");
+      // NOTE: Trip is NOT started here! Trip starts when truck begins moving away from Parking.
+    }
+    else
+    {
+      // Driver exited at Parking
+      clearDriver();
+      changeState(PARKED);
+      resetShift();
+      validDriverLED();
+      Serial.println("Driver session completed. Truck returned to PARKED state.");
+    }
   }
   else
   {
